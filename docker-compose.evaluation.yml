@@ -1,0 +1,174 @@
+name: pupilfirst-eval
+
+# =============================================================
+# Pupilfirst LMS — Evaluation Docker Compose
+#
+# This file is separate from the upstream docker-compose.yml.
+# It uses the official Dockerfile.evaluation provided by the project.
+#
+# Usage:
+#   cp .env.example .env
+#   docker compose -f docker-compose.evaluation.yml up -d
+#   http://localhost:3002
+#
+# Optional tools:
+#   docker compose -f docker-compose.evaluation.yml --profile tools up -d
+# =============================================================
+
+services:
+
+  # ── PostgreSQL Database ───────────────────────────────────
+  pupilfirst-db:
+    image: postgres:12-bookworm
+    container_name: pupilfirst-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pupilfirst
+      POSTGRES_PASSWORD: pupilfirst
+      POSTGRES_DB: pupilfirst_evaluation
+    volumes:
+      - pupilfirst-pgdata:/var/lib/postgresql/data
+    networks:
+      - pupilfirst-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pupilfirst -d pupilfirst_evaluation"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ── Redis (for Sidekiq background jobs) ──────────────────
+  pupilfirst-redis:
+    image: redis:7-alpine
+    container_name: pupilfirst-redis
+    restart: unless-stopped
+    volumes:
+      - pupilfirst-redisdata:/data
+    networks:
+      - pupilfirst-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Rails Web Application ─────────────────────────────────
+  pupilfirst-web:
+    platform: linux/x86_64
+    build:
+      context: .
+      dockerfile: Dockerfile.evaluation
+    container_name: pupilfirst-web
+    restart: unless-stopped
+    depends_on:
+      pupilfirst-db:
+        condition: service_healthy
+      pupilfirst-redis:
+        condition: service_healthy
+    ports:
+      - "${RAILS_PORT:-3002}:3000"
+    environment:
+      RAILS_ENV: production
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-1fe25dabb16153b60531917dce0f70e385be7e4f2581e62f10d91a94999de04225b3363b95bbc2b5967902d60be5dc85ae7661f13d325dcdc44dce4b7756c55e}
+      DB_HOST: pupilfirst-db
+      DB_NAME: pupilfirst_evaluation
+      DB_USERNAME: pupilfirst
+      DB_PASSWORD: pupilfirst
+      REDIS_URL: redis://pupilfirst-redis:6379/0
+      RAILS_SERVE_STATIC_FILES: "true"
+      # Disable external services for local eval
+      POSTMARK_API_TOKEN: ""
+      RECAPTCHA_DISABLED: "true"
+      # AWS LocalStack or disk storage (disable S3 for eval)
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-dummy_key}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-dummy_secret}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_BUCKET: ${AWS_BUCKET:-dummy-bucket}
+      # Miscellaneous
+      DEFAULT_SENDER_EMAIL_ADDRESS: noreply@localhost
+      MAX_UPLOAD_FILE_SIZE: "5242880"
+      ENABLE_MAINTENANCE_MODE: "false"
+    volumes:
+      - pupilfirst-storage:/app/storage
+      - pupilfirst-log:/app/log
+      - pupilfirst-pids:/app/tmp/pids
+    networks:
+      - pupilfirst-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ── Sidekiq Background Worker ─────────────────────────────
+  pupilfirst-worker:
+    platform: linux/x86_64
+    build:
+      context: .
+      dockerfile: Dockerfile.evaluation
+    container_name: pupilfirst-worker
+    restart: unless-stopped
+    depends_on:
+      pupilfirst-db:
+        condition: service_healthy
+      pupilfirst-redis:
+        condition: service_healthy
+    command: ["/tini", "--", "bundle", "exec", "sidekiq", "-C", "config/sidekiq.yml"]
+    environment:
+      RAILS_ENV: production
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:-1fe25dabb16153b60531917dce0f70e385be7e4f2581e62f10d91a94999de04225b3363b95bbc2b5967902d60be5dc85ae7661f13d325dcdc44dce4b7756c55e}
+      DB_HOST: pupilfirst-db
+      DB_NAME: pupilfirst_evaluation
+      DB_USERNAME: pupilfirst
+      DB_PASSWORD: pupilfirst
+      REDIS_URL: redis://pupilfirst-redis:6379/0
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-dummy_key}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-dummy_secret}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_BUCKET: ${AWS_BUCKET:-dummy-bucket}
+      DEFAULT_SENDER_EMAIL_ADDRESS: noreply@localhost
+      RECAPTCHA_DISABLED: "true"
+    volumes:
+      - pupilfirst-storage:/app/storage
+    networks:
+      - pupilfirst-network
+
+  # ── pgAdmin (optional — docker compose -f docker-compose.evaluation.yml --profile tools up) ──
+  pupilfirst-pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pupilfirst-pgadmin
+    profiles: [tools]
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@local.dev}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-pgadmin_secret}
+    ports:
+      - "${PGADMIN_PORT:-5053}:80"
+    volumes:
+      - pupilfirst-pgadmin-data:/var/lib/pgadmin
+    networks:
+      - pupilfirst-network
+    depends_on:
+      - pupilfirst-db
+
+# ── Named Volumes ─────────────────────────────────────────
+volumes:
+  pupilfirst-pgdata:
+    name: pupilfirst-pgdata
+  pupilfirst-redisdata:
+    name: pupilfirst-redisdata
+  pupilfirst-storage:
+    name: pupilfirst-storage
+  pupilfirst-log:
+    name: pupilfirst-log
+  pupilfirst-pids:
+    name: pupilfirst-pids
+  pupilfirst-pgadmin-data:
+    name: pupilfirst-pgadmin-data
+
+# ── Isolated Network ──────────────────────────────────────
+networks:
+  pupilfirst-network:
+    name: pupilfirst-network
+    driver: bridge
